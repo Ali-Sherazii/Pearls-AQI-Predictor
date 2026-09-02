@@ -107,7 +107,7 @@ for h in FORECAST_HORIZONS_H:
         continue
 
     delta = bundle["model"].predict(x)[0]
-    aqi = current_aqi + delta
+    aqi = current_aqi + bundle.get("alpha", 1.0) * delta
     cname, _ = category(aqi)
     target_time = T + timedelta(hours=h)
     rows.append({"horizon_h": f"+{h}h", "time": target_time, "aqi": aqi, "category": cname})

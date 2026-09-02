@@ -99,8 +99,10 @@ Settings -> Secrets and variables -> Actions.
   shared by backfill, the hourly pipeline, training, and serving
 - `src/feature_store/`, `src/models/registry.py` - Hopsworks-backed store and
   registry, each with a local fallback
-- `src/models/train.py` - the winning recipe (Random Forest on AQI-delta +
-  forecast weather, see `experiments/`) generalized across cities/horizons
+- `src/models/train.py` - trains on AQI-delta + forecast weather (see
+  `experiments/` for why), CV-selecting the best of several Random
+  Forest/HistGradientBoosting configs per city/horizon and calibrating a
+  persistence-shrinkage factor - see `report/report.md` Section 5b
 - `src/models/explain.py` - SHAP feature-contribution explanations
 - `src/pipelines/` - the three pipeline entry points above
 - `app/streamlit_app.py` - the dashboard

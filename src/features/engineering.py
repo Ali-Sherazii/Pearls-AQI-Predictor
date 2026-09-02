@@ -38,15 +38,41 @@ def engineer_features(raw: pd.DataFrame) -> pd.DataFrame:
     df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
     df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
 
+    # wind direction is circular (0deg == 360deg) - as a raw degree value a
+    # model sees north and "north minus one degree" as maximally different.
+    if "wind_direction_10m" in df.columns:
+        rad = np.deg2rad(df["wind_direction_10m"])
+        df["wind_dir_sin"] = np.sin(rad)
+        df["wind_dir_cos"] = np.cos(rad)
+
     # lags + rolling on the pollutants that actually drive AQI
     for col in ["us_aqi", "pm2_5", "pm10"]:
         df[f"{col}_lag1"] = df[col].shift(1)      # 1h ago
         df[f"{col}_lag24"] = df[col].shift(24)    # same hour yesterday
+        df[f"{col}_roll6"] = df[col].rolling(6, min_periods=1).mean()
         df[f"{col}_roll24"] = df[col].rolling(24, min_periods=1).mean()
+
+    # finer-grained recent AQI history and volatility - the original lag1/
+    # lag24 pair skips everything in between, which matters most at 24h/48h
+    for lag in (2, 3, 6, 12):
+        df[f"us_aqi_lag{lag}"] = df["us_aqi"].shift(lag)
+    df["us_aqi_rollstd24"] = df["us_aqi"].rolling(24, min_periods=2).std()
+
+    # light touch on the other pollutants - just enough temporal context to
+    # let the model use them as more than a single noisy instantaneous reading
+    for col in ["carbon_monoxide", "nitrogen_dioxide", "sulphur_dioxide", "ozone"]:
+        if col in df.columns:
+            df[f"{col}_lag1"] = df[col].shift(1)
+            df[f"{col}_lag24"] = df[col].shift(24)
 
     # derived: AQI change rate
     df["aqi_change_1h"] = df["us_aqi"].diff(1)
     df["aqi_change_24h"] = df["us_aqi"].diff(24)
+
+    # a pressure drop often precedes a front moving through and dispersing
+    # (or trapping) pollution - a leading indicator persistence can't see
+    if "surface_pressure" in df.columns:
+        df["pressure_change_3h"] = df["surface_pressure"].diff(3)
 
     return df
 
@@ -72,6 +98,13 @@ def build_future_weather(df: pd.DataFrame, h: int) -> pd.DataFrame:
     for w in WX_VARS:
         if w in df.columns:
             fut[f"{w}_t{h}h"] = df[w].shift(-h)
+    if "wind_direction_10m" in df.columns:
+        # replace the raw future degree value with its cyclic encoding, same
+        # reasoning as engineer_features's present-time wind_dir_sin/cos
+        rad = np.deg2rad(df["wind_direction_10m"].shift(-h))
+        fut[f"wind_dir_sin_t{h}h"] = np.sin(rad)
+        fut[f"wind_dir_cos_t{h}h"] = np.cos(rad)
+        fut = fut.drop(columns=[f"wind_direction_10m_t{h}h"])
     if "precipitation" in df.columns:
         fut[f"precip_sum_next{h}h"] = df["precipitation"].rolling(h).sum().shift(-h)
     if "wind_speed_10m" in df.columns:
@@ -92,6 +125,11 @@ def future_weather_at(fcw: pd.DataFrame, T: pd.Timestamp, h: int) -> dict:
     for w in WX_VARS:
         if w in fcw.columns:
             feat[f"{w}_t{h}h"] = fcw.at[tgt, w] if tgt in fcw.index else np.nan
+    if "wind_direction_10m" in fcw.columns:
+        wd = feat.pop(f"wind_direction_10m_t{h}h", np.nan)
+        rad = np.deg2rad(wd) if pd.notna(wd) else np.nan
+        feat[f"wind_dir_sin_t{h}h"] = np.sin(rad) if pd.notna(rad) else np.nan
+        feat[f"wind_dir_cos_t{h}h"] = np.cos(rad) if pd.notna(rad) else np.nan
     if "precipitation" in fcw.columns:
         feat[f"precip_sum_next{h}h"] = window["precipitation"].sum()
     if "wind_speed_10m" in fcw.columns:

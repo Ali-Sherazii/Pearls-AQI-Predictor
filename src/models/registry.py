@@ -4,6 +4,7 @@ src/feature_store/store.py's dual-mode approach exactly.
 """
 
 from __future__ import annotations
+import tempfile
 from pathlib import Path
 
 import joblib
@@ -38,7 +39,14 @@ def load_model(city: str, horizon_h: int) -> dict:
         project = get_hopsworks_project()
         mr = project.get_model_registry()
         model = mr.get_model(model_name(city, horizon_h), version=MODEL_REGISTRY_VERSION)
-        model_dir = Path(model.download())
+        # Hopsworks' own download cache is keyed by model id and is supposed
+        # to auto-invalidate when a version is deleted/recreated, but that
+        # didn't hold up in practice (a retrain under the same name/version
+        # served a stale cached copy). Downloading to a fresh temp dir every
+        # call sidesteps that entirely - cheap given these models are a few
+        # MB, and the dashboard's own @st.cache_resource already avoids
+        # repeat downloads within one running process.
+        model_dir = Path(model.download(local_path=tempfile.mkdtemp(prefix="aqi_model_")))
         path = next(model_dir.glob("*.joblib"))
         return joblib.load(path)
 

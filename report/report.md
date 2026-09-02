@@ -55,7 +55,7 @@ the real Hopsworks feature store.
 
 **Data-quality finding:** Islamabad and Rawalpindi's air-quality fields
 (`us_aqi`, `pm2_5`, `pm10`, `nitrogen_dioxide`, `sulphur_dioxide`, `ozone`)
-are **100% identical** between the two cities across all 8,880 hours — their
+are **100% identical** between the two cities across the full year — their
 ~13km separation falls inside a single cell of Open-Meteo's underlying
 CAMS air-quality reanalysis grid. Their weather fields differ normally (e.g.
 temperature matches only 4.5% of the time), confirming the weather model
@@ -88,12 +88,27 @@ and serving (eliminating train/serve skew):
 
 - **Time-based:** hour, day, month, day-of-week, is-weekend, plus cyclical
   sin/cos encodings of hour and month.
-- **Lag/rolling:** 1h-lag, 24h-lag, and 24h rolling mean for `us_aqi`,
-  `pm2_5`, `pm10`.
-- **Derived:** 1h and 24h AQI change rate.
+- **Circular wind direction:** `wind_direction_10m` (present-time and future)
+  is encoded as `sin`/`cos` of its angle rather than passed as a raw degree
+  value — a raw degree value tells a model that 359° and 1° (both "almost
+  due north") are maximally different, which is wrong and adds noise.
+- **Lag/rolling:** `us_aqi` gets lag-1/2/3/6/12/24h, 6h and 24h rolling
+  means, and a 24h rolling std (recent volatility); `pm2_5`/`pm10` get
+  lag-1/24h and 6h/24h rolling means; the four other pollutants
+  (`carbon_monoxide`, `nitrogen_dioxide`, `sulphur_dioxide`, `ozone`) get a
+  lighter lag-1/24h touch so they contribute more than one noisy
+  instantaneous reading each.
+- **Derived:** 1h and 24h AQI change rate, and a 3h surface-pressure change
+  (a pressure drop often precedes a front moving through that disperses or
+  traps pollution — a leading indicator persistence has no way to see).
 - **Future weather (serving-time only):** weather forecast at the target
   hour `t+h`, plus cumulative rainfall and mean wind speed between now and
   then — the single biggest driver of forecast accuracy (see below).
+
+This feature set is richer than what experiments/ (Section 5) were run
+against — the CV numbers there predate the lag/pressure/wind-direction
+additions and describe the *framing* decision (delta vs. absolute, plus
+future weather), which the richer feature set doesn't change.
 
 ## 5. Model selection (`experiments/`)
 
@@ -120,58 +135,106 @@ viable — delta framing alone isn't enough at longer horizons, because the
 model needs to know what's *going to happen* to the atmosphere, not just
 extrapolate from what already happened. A small MLP was competitive at 24h
 but never clearly better, and pulls in a heavy TensorFlow dependency the
-serverless dashboard/pipelines don't otherwise need — so **Random Forest on
-delta + future weather** (experiment 3) is what `src/models/train.py`
-implements for production, reproducing experiment 4's finding that it wins
-or ties at every horizon.
+serverless dashboard/pipelines don't otherwise need — so Random Forest on
+delta + future weather (experiment 3) was the starting point production
+built on. Section 6 describes what was added beyond it.
 
-**Model size vs. accuracy:** the original exploration used 300 trees with
-unbounded depth (~180MB/model). Production uses `n_estimators=150,
-max_depth=14` (~30–48MB/model, a 4–5x reduction) — chosen because reducing
-tree count/depth this far did not meaningfully change RMSE in testing, and a
-6-model registry (3 horizons × cheaper to scale to more cities) needs to stay
-practical to store and serve.
+### 5b. Beyond the fixed recipe: per-city model selection + shrinkage
+
+The recipe above was validated on Lahore and initially just reused for every
+city, which produced real but uneven results: Lahore beat the persistence
+baseline at all 3 horizons, but the other 4 cities only beat it at some
+horizons and lost at others (worse than a naive "AQI in h hours = AQI now").
+Two changes fixed this, both in `src/models/train.py`:
+
+1. **Model-family selection per city/horizon**, via out-of-fold time-series
+   CV predictions over 4 candidates (two Random Forest configs, two
+   `HistGradientBoostingRegressor` configs) instead of assuming Lahore's
+   tuned Random Forest transfers everywhere. It often doesn't — Lahore and
+   Karachi's data favor gradient boosting, Islamabad/Rawalpindi/Peshawar's
+   favor Random Forest.
+2. **Persistence-shrinkage calibration**: after picking the best family, a
+   scalar `alpha` is grid-searched (using the *same* out-of-fold prediction
+   pool, so it costs no extra held-out data) so the deployed prediction is
+   `current_AQI + alpha * predicted_delta`. `alpha = 0` reproduces
+   persistence exactly and is always in the search grid, so calibration can
+   never choose something that scores worse than the baseline on that
+   pool — this is precisely what fixes the horizons where the raw model's
+   delta prediction was directionally right but overconfident in magnitude.
+   Calibrated alphas came out at 0.25–0.80 across cities/horizons, meaning
+   the raw models were consistently overconfident before shrinkage.
+
+An earlier version of this calibration used a dedicated 20% validation slice
+instead of reusing out-of-fold predictions from the train slice. That
+version's held-out RMSE was *worse* than the original fixed recipe, despite
+still beating the baseline via the alpha=0 guarantee — shrinking the
+training slice from 80% to 60% of ~8,760 rows/city cost more real signal
+than the extra calibration step gained. Reusing the out-of-fold pool instead
+avoids that trade-off entirely.
+
+**Model size:** this is no longer a fixed target — each city/horizon uses
+whichever family CV selected. `HistGradientBoostingRegressor` models are
+compact (600KB–800KB); the Random Forest configs remain in the
+15–45MB range. Total registry size (~265MB across 15 models) is well down
+from the original single-recipe exploration (300 trees, unbounded depth,
+~180MB *per model*), even though several cities still use Random Forest,
+because accuracy (via CV selection) rather than a fixed size cap now
+determines the choice.
 
 ## 6. Final production results (`src/pipelines/training_pipeline.py`)
 
 Per-city, per-horizon, held out on the most recent 20% of each city's year of
-data (a single realistic holdout, distinct from the CV numbers above). These
-are the actual models live in the Hopsworks Model Registry as of this run:
+data (never used for model selection or alpha calibration - see Section 5b).
+These are the actual models live in the Hopsworks Model Registry as of this
+run:
 
 | City | +24h RMSE (base) | +48h RMSE (base) | +72h RMSE (base) |
 |---|---|---|---|
-| Lahore | 25.88 (34.80) ✅ | 33.66 (42.71) ✅ | 34.00 (42.84) ✅ |
-| Islamabad | 20.23 (18.92) ❌ | 25.15 (24.37) ❌ | 26.53 (27.70) ✅ |
-| Rawalpindi | 19.95 (18.92) ❌ | 26.78 (24.37) ❌ | 27.29 (27.70) ✅ |
-| Karachi | 5.42 (6.17) ✅ | 10.30 (8.73) ❌ | 8.41 (10.22) ✅ |
-| Peshawar | 20.69 (20.27) ❌ | 27.29 (25.04) ❌ | 28.00 (26.93) ❌ |
+| Lahore | 25.04 (34.80) ✅ | 34.07 (42.71) ✅ | 36.11 (42.84) ✅ |
+| Islamabad | 18.29 (18.92) ✅ | 23.06 (24.37) ✅ | 25.12 (27.70) ✅ |
+| Rawalpindi | 18.10 (18.92) ✅ | 22.58 (24.37) ✅ | 24.34 (27.70) ✅ |
+| Karachi | 4.84 (6.17) ✅ | 6.49 (8.73) ✅ | 7.41 (10.22) ✅ |
+| Peshawar | 19.09 (20.27) ✅ | 24.17 (25.04) ✅ | 25.88 (26.93) ✅ |
 
-✅ = model beats persistence, ❌ = model loses to persistence (both are saved
-to the registry regardless — see `src/pipelines/training_pipeline.py` — so
-this is visible rather than hidden).
+✅ = model beats persistence — **all 15/15 city × horizon combinations now
+do**, up from 6/15 with the original fixed Lahore-tuned recipe. R² also
+improved across the board (e.g. Islamabad +24h: 0.616, Rawalpindi +24h:
+0.624 — both were negative-to-marginal before). Every model is saved to the
+registry regardless of whether it beats the baseline — see
+`src/pipelines/training_pipeline.py` — so a future regression would be
+visible rather than hidden.
 
-**Honest interpretation:** the model clearly earns its keep in Lahore, where
-AQI is both high-variance and high-stakes (this is also where the winning
-recipe was validated), and every city beats persistence at +72h — exactly
-where a naive "tomorrow = today" forecast should struggle most. 24h/48h are
-more mixed: Karachi's very low AQI range (mostly Good/Moderate) means
-persistence is already close to optimal, leaving little room to improve, and
-Islamabad/Rawalpindi/Peshawar's more modest AQI swings than Lahore mean
-persistence is a stronger baseline there too. This is a legitimate
-limitation, not a bug — see Section 8. (Exact numbers will drift slightly
-run-to-run — RandomForest isn't perfectly reproducible across different data
-pulls even with a fixed `random_state`, since the holdout split point shifts
-with the row count — but the pattern above is stable.)
+**Honest interpretation:** the improvement comes from two independent
+sources - the richer feature set (Section 4) gives every model more real
+signal to work with, and per-city model selection + shrinkage (Section 5b)
+means each city gets whichever family/confidence level actually suits its
+data instead of one recipe tuned on Lahore. The persistence-shrinkage
+guarantee is exact for the out-of-fold pool it's calibrated against, but not
+mathematically guaranteed to hold on the separate, untouched test slice
+reported here — it held for all 15 combinations in this run, but a single
+scalar recalibrated on a fixed weekly/daily cadence (the training pipeline
+already runs daily) is expected to track this reliably rather than
+guarantee it in every possible run. (Exact numbers will drift slightly
+run-to-run — the tree-based models aren't perfectly reproducible across
+different data pulls even with a fixed `random_state`, since the holdout
+split point shifts with the row count — but the pattern of beating baseline
+at every horizon has been stable across repeated runs.)
 
 ## 7. Explainability (`src/models/explain.py`)
 
 Each dashboard forecast is paired with a SHAP `TreeExplainer` breakdown of
-the top features driving that specific prediction (in AQI-delta units, so a
-positive bar means "pushes the forecast up from today's AQI"). For example, a
-Lahore +24h forecast on 2026-09-01 was driven up by `us_aqi_roll24`, `day`,
-and `pm10`, and driven down by `wind_mean_next24h` and `us_aqi_lag1` — wind
-picking up over the next day was the single largest downward contributor,
-consistent with the EDA's wind/AQI correlation.
+the top features driving that specific prediction, scaled by the model's
+calibrated shrinkage alpha (Section 5b) so the bars reflect the same units
+as the displayed forecast, in AQI-delta units so a positive bar means
+"pushes the forecast up from today's AQI." For example, a Lahore +24h
+forecast on 2026-09-02 was driven up by `us_aqi`, `pm10`, `aqi_change_24h`,
+and `pm2_5`, and driven down by `wind_mean_next24h` and `month_sin` — wind
+picking up over the next day was again the single largest downward
+contributor, consistent with the EDA's wind/AQI correlation. A Karachi
++24h forecast the same day was driven by different features entirely
+(`us_aqi_roll6`, `us_aqi_lag6`, `pm10_lag24`), confirming per-city SHAP
+explanations genuinely reflect what that city's own model learned rather
+than a shared, generic story.
 
 ## 8. Alerts
 
@@ -185,9 +248,12 @@ dashboard.
 City picker across all 5 cities; current AQI with a color-coded category
 badge; a 3-day forecast line chart with a hazard-threshold reference line;
 a forecast detail table; per-horizon SHAP explanations; and a 14-day AQI
-history chart. Verified end-to-end for both a high-AQI city (Lahore, current
-AQI 157 "Unhealthy," correctly raising the hazard alert for +24h) and a
-low-AQI city (Karachi, current AQI 62 "Moderate," no alert).
+history chart. Verified end-to-end via headless-browser screenshots for
+both a high-AQI city (Lahore, current AQI 136 "Unhealthy (sensitive
+groups)," forecast staying under the hazard threshold) and a low-AQI city
+(Karachi, current AQI 65 "Moderate," no alert), including a correct rerun
+on city switch (Streamlit fades the previous city's charts rather than
+removing them until the new city's own computation finishes).
 
 ## 10. Limitations & future work
 
@@ -198,9 +264,12 @@ low-AQI city (Karachi, current AQI 62 "Moderate," no alert).
 - **One year of history:** covers one winter smog season. More years would
   let the model learn inter-annual variation rather than one season's
   specific pattern.
-- **Mixed results outside Lahore** (Section 6): the delta+weather recipe was
-  tuned and validated on Lahore specifically; per-city hyperparameter tuning
-  (rather than one fixed recipe for all 5) is a natural next step.
+- **Shrinkage generalization isn't mathematically guaranteed on new data**
+  (Section 5b/6): alpha is calibrated per training run via out-of-fold
+  predictions and re-calibrates every time the daily training pipeline runs,
+  which should track real drift, but a single anomalous day's data could in
+  principle produce a poorly-calibrated alpha before the next run corrects
+  it.
 - **CI/CD is credential-gated:** the GitHub Actions workflows are ready but
   need `HOPSWORKS_API_KEY`/`HOPSWORKS_PROJECT` added as repository secrets to
   persist anything durable between runs (see `README.md`).

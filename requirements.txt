@@ -1,0 +1,24 @@
+# Core
+pandas
+numpy
+requests
+python-dotenv
+
+# Modeling
+scikit-learn
+joblib
+shap
+
+# Feature store / model registry (real Hopsworks mode; not required for the
+# local-parquet/joblib fallback used in dev - see src/feature_store/store.py)
+# The [python] extra pulls in confluent-kafka, which the feature-group
+# ingestion path needs at runtime (not just for local dev).
+hopsworks[python]
+
+# Dashboard
+streamlit
+plotly
+
+# Notebook
+jupyter
+matplotlib

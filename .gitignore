@@ -1,0 +1,21 @@
+# Environment
+.env
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Local feature-store / model-registry fallback (regenerable via the pipelines)
+data/*.parquet
+data/*.csv
+models/*.joblib
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

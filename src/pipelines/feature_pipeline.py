@@ -12,6 +12,7 @@ Run:  python -m src.pipelines.feature_pipeline
 
 from __future__ import annotations
 import argparse
+import sys
 
 from config import CITIES
 from src.data.fetch import fetch_recent_raw
@@ -29,8 +30,19 @@ def run_city(city: str, window_days: int = RECENT_WINDOW_DAYS):
 
 
 def main(cities: list[str] | None = None):
+    # One city's failure (a still-flaky upstream API, an intermittent
+    # Hopsworks error) shouldn't cost the other four their hourly update -
+    # run each independently and only fail the job at the end if any did.
+    failed = []
     for city in (cities or list(CITIES)):
-        run_city(city)
+        try:
+            run_city(city)
+        except Exception as exc:
+            print(f"{city}: FAILED - {exc!r}")
+            failed.append(city)
+    if failed:
+        print(f"\n{len(failed)} of {len(cities or CITIES)} cities failed: {failed}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

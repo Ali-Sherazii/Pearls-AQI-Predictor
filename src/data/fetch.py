@@ -22,17 +22,29 @@ from config import (
 )
 
 
-def _get_hourly(url: str, params: dict, tries: int = 3) -> pd.DataFrame:
+def _get_hourly(url: str, params: dict, tries: int = 4) -> pd.DataFrame:
     """GET an Open-Meteo endpoint and return its `hourly` block as a DataFrame."""
+    last_exc = None
     for attempt in range(tries):
-        r = requests.get(url, params=params, timeout=60)
+        try:
+            r = requests.get(url, params=params, timeout=60)
+        except requests.exceptions.RequestException as exc:
+            # network-level failures (read timeouts, connection resets) - the
+            # original version only retried on a non-200 status code, so one
+            # of these would crash the whole pipeline with zero retries.
+            last_exc = exc
+            time.sleep(3 * (attempt + 1))
+            continue
         if r.status_code == 200:
             hourly = r.json()["hourly"]
             df = pd.DataFrame(hourly)
             df["time"] = pd.to_datetime(df["time"])
             return df.set_index("time")
+        last_exc = None
         # 429 = rate limited; back off and retry
-        time.sleep(2 * (attempt + 1))
+        time.sleep(3 * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
     r.raise_for_status()
 
 

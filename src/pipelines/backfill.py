@@ -9,6 +9,7 @@ Run:  python -m src.pipelines.backfill [--city lahore] [--history-days 365]
 
 from __future__ import annotations
 import argparse
+import sys
 
 from config import CITIES, HISTORY_DAYS
 from src.data.fetch import fetch_raw_history
@@ -27,8 +28,17 @@ def backfill_city(city: str, history_days: int = HISTORY_DAYS):
 
 
 def main(cities: list[str] | None = None, history_days: int = HISTORY_DAYS):
+    # Don't let one city's transient failure cost the others their backfill.
+    failed = []
     for city in (cities or list(CITIES)):
-        backfill_city(city, history_days)
+        try:
+            backfill_city(city, history_days)
+        except Exception as exc:
+            print(f"{city}: FAILED - {exc!r}")
+            failed.append(city)
+    if failed:
+        print(f"\n{len(failed)} of {len(cities or CITIES)} cities failed: {failed}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

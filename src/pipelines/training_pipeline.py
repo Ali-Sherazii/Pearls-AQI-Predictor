@@ -9,6 +9,7 @@ Run:  python -m src.pipelines.training_pipeline
 
 from __future__ import annotations
 import argparse
+import sys
 
 from config import CITIES, FORECAST_HORIZONS_H
 from src.feature_store.store import read_features
@@ -28,8 +29,17 @@ def run_city(city: str, horizons=FORECAST_HORIZONS_H):
 
 
 def main(cities: list[str] | None = None, horizons=FORECAST_HORIZONS_H):
+    # Don't let one city's transient failure cost the others their retrain.
+    failed = []
     for city in (cities or list(CITIES)):
-        run_city(city, horizons)
+        try:
+            run_city(city, horizons)
+        except Exception as exc:
+            print(f"{city}: FAILED - {exc!r}")
+            failed.append(city)
+    if failed:
+        print(f"\n{len(failed)} of {len(cities or CITIES)} cities failed: {failed}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

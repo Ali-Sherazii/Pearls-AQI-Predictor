@@ -39,6 +39,15 @@ _READ_RETRY_DELAYS_S = [10, 20, 30, 45, 60, 90]
 _READ_TIMEOUT_S = 150
 _read_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="hopsworks-read")
 
+# Writes can also hit transient connection errors talking to the Hopsworks
+# REST API (seen in practice: a ConnectionError/RemoteDisconnected while
+# launching the materialization job). Retrying is safe because inserts are
+# Hudi upserts keyed on `time` - resubmitting the same rows just overwrites
+# them with identical values, never duplicates. Shorter backoff than reads
+# since this failure mode has shown up as a fast connection drop, not a slow
+# server-side convergence issue.
+_WRITE_RETRY_DELAYS_S = [15, 30, 60]
+
 _project = None
 
 
@@ -77,8 +86,15 @@ def write_features(city: str, df: pd.DataFrame) -> None:
 
     if HOPSWORKS_ENABLED:
         fg = _get_or_create_feature_group(city)
-        fg.insert(flat, write_options={"wait_for_job": True})
-        return
+        for i, delay in enumerate([0, *_WRITE_RETRY_DELAYS_S]):
+            if delay:
+                time.sleep(delay)
+            try:
+                fg.insert(flat, write_options={"wait_for_job": True})
+                return
+            except Exception:
+                if i == len(_WRITE_RETRY_DELAYS_S):
+                    raise
 
     path = _local_path(city)
     if path.exists():
